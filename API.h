@@ -6,6 +6,7 @@ int API_mazeHeight();
 int API_wallFront();
 int API_wallRight();
 int API_wallLeft();
+int API_wallBack();
 
 int API_moveForward();  // Returns 0 if crash, else returns 1
 void API_turnRight();
@@ -18,9 +19,12 @@ void API_setColor(int x, int y, char color);
 void API_clearColor(int x, int y);
 void API_clearAllColor();
 
-void API_setText(int x, int y, char* str);
+void API_setText(int x, int y, const char* str);
 void API_clearText(int x, int y);
 void API_clearAllText();
 
 int API_wasReset();
 void API_ackReset();
+
+// Only answered by recent simulator builds. Returns -1 if the reply is empty.
+double API_getStat(const char* stat);

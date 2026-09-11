@@ -4,11 +4,23 @@
 
 #define BUFFER_SIZE 32
 
+// The simulator drives the mouse by request and reply over stdin/stdout, so
+// every read below blocks until it answers. A closed stdin means the
+// simulator is gone and there is nothing left to do, which is worth saying
+// out loud rather than carrying on over an uninitialised buffer.
+static void readLine(char* response, int size) {
+    if (fgets(response, size, stdin) == NULL) {
+        fprintf(stderr, "simulator closed the connection\n");
+        fflush(stderr);
+        exit(EXIT_FAILURE);
+    }
+}
+
 int getInteger(char* command) {
     printf("%s\n", command);
     fflush(stdout);
     char response[BUFFER_SIZE];
-    fgets(response, BUFFER_SIZE, stdin);
+    readLine(response, BUFFER_SIZE);
     int value = atoi(response);
     return value;
 }
@@ -17,7 +29,7 @@ int getBoolean(char* command) {
     printf("%s\n", command);
     fflush(stdout);
     char response[BUFFER_SIZE];
-    fgets(response, BUFFER_SIZE, stdin);
+    readLine(response, BUFFER_SIZE);
     int value = (strcmp(response, "true\n") == 0);
     return value;
 }
@@ -26,7 +38,7 @@ int getAck(char* command) {
     printf("%s\n", command);
     fflush(stdout);
     char response[BUFFER_SIZE];
-    fgets(response, BUFFER_SIZE, stdin);
+    readLine(response, BUFFER_SIZE);
     int success = (strcmp(response, "ack\n") == 0);
     return success;
 }
@@ -49,6 +61,10 @@ int API_wallRight() {
 
 int API_wallLeft() {
     return getBoolean("wallLeft");
+}
+
+int API_wallBack() {
+    return getBoolean("wallBack");
 }
 
 int API_moveForward() {
@@ -88,7 +104,7 @@ void API_clearAllColor() {
     fflush(stdout);
 }
 
-void API_setText(int x, int y, char* text) {
+void API_setText(int x, int y, const char* text) {
     printf("setText %d %d %s\n", x, y, text);
     fflush(stdout);
 }
@@ -109,4 +125,13 @@ int API_wasReset() {
 
 void API_ackReset() {
     getAck("ackReset");
+}
+
+double API_getStat(const char* stat) {
+    printf("getStat %s\n", stat);
+    fflush(stdout);
+    char response[BUFFER_SIZE];
+    readLine(response, BUFFER_SIZE);
+    if (response[0] == '\n' || response[0] == '\0') return -1.0;
+    return atof(response);
 }

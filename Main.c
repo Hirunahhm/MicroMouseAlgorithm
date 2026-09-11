@@ -1,199 +1,141 @@
 #include <stdio.h>
 #include <stdbool.h>
-#include <stdint.h>
 #include "API.h"
 #include "maze.h"
 
-// Mouse state
-int mouse_x = 0, mouse_y = 0;
-Direction mouse_dir = NORTH;
-Phase current_phase = EXPLORE_TO_GOAL;
+/* The simulator only answers getStat in recent builds, so asking for it on an
+   older one would block forever waiting for a reply. Off by default; turn it
+   on to compare runs after a change to the cost model. */
+#define REPORT_STATS 0
 
-// Wall and distance arrays
-bool v_walls[MAZE_SIZE][MAZE_SIZE + 1];
-bool h_walls[MAZE_SIZE + 1][MAZE_SIZE];
-uint8_t dist[MAZE_SIZE][MAZE_SIZE];
-bool visited_to_goal[MAZE_SIZE][MAZE_SIZE];
-bool visited_to_start[MAZE_SIZE][MAZE_SIZE];
-bool visited_speed[MAZE_SIZE][MAZE_SIZE];
-bool backtrack_cells[MAZE_SIZE][MAZE_SIZE];
-bool revisited_cells[MAZE_SIZE][MAZE_SIZE];
-bool dead_end_cells[MAZE_SIZE][MAZE_SIZE];
-
-// Queue for floodfill
-int queue[QUEUE_SIZE][2];
-int queue_head = 0, queue_tail = 0;
-
-int main(int argc, char* argv[]) {
-    debug_log("Starting Floodfill...");
-    initWalls();
-    for (int y = 0; y < MAZE_SIZE; y++) {
-        for (int x = 0; x < MAZE_SIZE; x++) {
-            visited_to_goal[y][x] = false;
-            visited_to_start[y][x] = false;
-        }
-    }
-    visited_to_goal[0][0] = true;
-    floodfill_phase(EXPLORE_TO_GOAL);
-
+static void drawStart(void) {
     API_setColor(0, 0, 'G');
     API_setText(0, 0, "Start");
+}
+
+static bool mazeSizeOk(void) {
+    if (API_mazeWidth() == MAZE_SIZE && API_mazeHeight() == MAZE_SIZE) return true;
+    debug_log("Error: maze size does not match MAZE_SIZE");
+    return false;
+}
+
+#if REPORT_STATS
+static void reportStats(void) {
+    char line[64];
+    snprintf(line, sizeof(line), "total distance: %g", API_getStat("total-distance"));
+    debug_log(line);
+    snprintf(line, sizeof(line), "total turns: %g", API_getStat("total-turns"));
+    debug_log(line);
+    snprintf(line, sizeof(line), "best run turns: %g", API_getStat("best-run-turns"));
+    debug_log(line);
+    snprintf(line, sizeof(line), "score: %g", API_getStat("score"));
+    debug_log(line);
+}
+#endif
+
+int main(void) {
+    int total_steps = 0;
+
+    debug_log("Starting flood fill solver...");
+    if (!mazeSizeOk()) return 1;
+
+    resetState();
+    drawStart();
 
     while (1) {
         if (API_wasReset()) {
             debug_log("Reset detected!");
             API_ackReset();
-            mouse_x = 0;
-            mouse_y = 0;
-            mouse_dir = NORTH;
-            current_phase = EXPLORE_TO_GOAL;
-            initWalls();
-            floodfill_phase(EXPLORE_TO_GOAL);
-            for (int y = 0; y < MAZE_SIZE; y++)
-                for (int x = 0; x < MAZE_SIZE; x++)
-                    visited_speed[y][x] = false;
-            for (int y = 0; y < MAZE_SIZE; y++)
-                for (int x = 0; x < MAZE_SIZE; x++)
-                    backtrack_cells[y][x] = false;
-            for (int y = 0; y < MAZE_SIZE; y++)
-                for (int x = 0; x < MAZE_SIZE; x++)
-                    revisited_cells[y][x] = false;
-            for (int y = 0; y < MAZE_SIZE; y++) {
-                for (int x = 0; x < MAZE_SIZE; x++) {
-                    visited_to_goal[y][x] = false;
-                    visited_to_start[y][x] = false;
-                }
-            }
-            visited_to_goal[0][0] = true;
+            if (!mazeSizeOk()) return 1;
+            resetState();
             API_clearAllColor();
             API_clearAllText();
-            API_setColor(0, 0, 'G');
-            API_setText(0, 0, "Start");
+            drawStart();
+            total_steps = 0;
             continue;
         }
 
-        if (API_mazeWidth() != MAZE_SIZE || API_mazeHeight() != MAZE_SIZE) {
-            debug_log("Error: Maze size mismatch!");
+        if (++total_steps > MAX_TOTAL_STEPS) {
+            debug_log("Step budget exhausted, giving up.");
             break;
         }
 
-    if (current_phase == EXPLORE_TO_GOAL && (mouse_x == 7 || mouse_x == 8) && (mouse_y == 7 || mouse_y == 8)) {
-            // Only transition after ALL 4 goal-center cells have been physically visited
-            bool all_goal_cells_visited =
-                visited_to_goal[7][7] && visited_to_goal[7][8] &&
-                visited_to_goal[8][7] && visited_to_goal[8][8];
-            if (all_goal_cells_visited) {
-                API_setColor(mouse_x, mouse_y, 'R');
-                debug_log("All 4 goal cells explored! Initiating exploratory return trip...");
-                for (int y = 0; y < MAZE_SIZE; y++) {
-                    for (int x = 0; x < MAZE_SIZE; x++) {
-                        if (!visited_to_goal[y][x]) {
-                            dist[y][x] = MAX_DIST;
-                        }
-                    }
-                }
-                current_phase = EXPLORE_TO_START;
-                for (int y = 0; y < MAZE_SIZE; y++)
-                    for (int x = 0; x < MAZE_SIZE; x++)
-                        visited_to_start[y][x] = false;
-                visited_to_start[mouse_y][mouse_x] = true;
-                floodfill_phase(EXPLORE_TO_START);
-                continue;
-            } else {
-                // Still in the goal area but not all cells visited; keep exploring other goal cells
-                debug_log("At goal area, continuing to visit remaining goal-center cells...");
-            }
+        bool stale = false;
+        if (current_phase != SPEED_TO_GOAL) {
+            /* Only a wall the map did not already have can change the route. */
+            if (updateWalls()) stale = true;
         }
 
-    if (current_phase == EXPLORE_TO_START && mouse_x == 0 && mouse_y == 0) {
-            API_setColor(mouse_x, mouse_y, 'G');
-            debug_log("Returned to start! Initiating speed run to goal...");
-            for (int y = 0; y < MAZE_SIZE; y++) {
-                for (int x = 0; x < MAZE_SIZE; x++) {
-                    if (!visited_to_start[y][x]) {
-                        dist[y][x] = MAX_DIST; // unvisited set to unknown
-                    }
-                }
-            }
-            current_phase = SPEED_TO_GOAL;
-            for (int y = 0; y < MAZE_SIZE; y++)
-                for (int x = 0; x < MAZE_SIZE; x++)
-                    visited_speed[y][x] = false;
-            visited_speed[mouse_y][mouse_x] = true;
-            // Prepare and run specialized speed run floodfill (which inherently ignores invalid cells)
-            floodfill_speed_run();
-            show_dist();
-            continue;
-        }
+        Phase previous = current_phase;
 
-    if (current_phase == SPEED_TO_GOAL && dist[mouse_y][mouse_x] == 0) {
+        if (current_phase == EXPLORE_TO_GOAL && atGoal()) {
             API_setColor(mouse_x, mouse_y, 'R');
-            debug_log("Speed run to goal complete!");
+            debug_log("Reached the goal, heading back to the start.");
+            current_phase = EXPLORE_TO_START;
+
+        } else if (current_phase == EXPLORE_TO_START && atStart()) {
+            /* Two runs only: one lap out, one lap back, then the speed run.
+               Both laps sense every cell they enter, so the route they walked
+               is fully known and the pessimistic map always has a way home.
+               The cost is that the speed run is the best route through what
+               was seen, not the best route in the maze. */
+            API_setColor(mouse_x, mouse_y, 'G');
+            debug_log("Exploration done, running the best known route.");
+            current_phase = SPEED_TO_GOAL;
+
+        } else if (current_phase == SPEED_TO_GOAL && atGoal()) {
+            API_setColor(mouse_x, mouse_y, 'R');
+            debug_log("Speed run complete.");
             break;
         }
 
-        if (current_phase == EXPLORE_TO_GOAL) {
-            updateWalls();
-            floodfill_phase(EXPLORE_TO_GOAL);
-        } else if (current_phase == EXPLORE_TO_START) {
-            updateWalls();
-            floodfill_phase(EXPLORE_TO_START);
-        } else {
-            show_dist();
+        if (current_phase != previous) {
+            stale = true;
+            if (current_phase == SPEED_TO_GOAL) {
+                computeCostMap(current_phase);
+                stale = false;
+                showCosts();
+            }
+        }
+        if (stale) computeCostMap(current_phase);
+
+        TurnCmd cmd = nextMove();
+        if (cmd == TURN_BLOCKED) {
+            debug_log("No move leads closer to the target, giving up.");
+            break;
         }
 
-        int dir = getBestDirection();
-        if ((current_phase == EXPLORE_TO_GOAL || current_phase == EXPLORE_TO_START) && dir == 2) {
-            backtrack_cells[mouse_y][mouse_x] = true;
-        }
-        if (dir == -1) {
-            API_turnLeft();
-            mouse_dir = (mouse_dir + 3) % 4;
-        } else if (dir == 1) {
-            API_turnRight();
-            mouse_dir = (mouse_dir + 1) % 4;
-        } else if (dir == 2) {
-            API_turnLeft();
-            API_turnLeft();
-            mouse_dir = (mouse_dir + 2) % 4;
+        switch (cmd) {
+            case TURN_LEFT:
+                API_turnLeft();
+                mouse_dir = (Direction)((mouse_dir + 3) & 3);
+                break;
+            case TURN_RIGHT:
+                API_turnRight();
+                mouse_dir = (Direction)((mouse_dir + 1) & 3);
+                break;
+            case TURN_BACK:
+                API_turnLeft();
+                API_turnLeft();
+                mouse_dir = (Direction)((mouse_dir + 2) & 3);
+                break;
+            default:
+                break;
         }
 
         if (API_moveForward() == 0) {
             debug_log("Crash detected!");
             break;
         }
+        applyMove();
 
-        if (mouse_dir == NORTH) mouse_y++;
-        else if (mouse_dir == EAST) mouse_x++;
-        else if (mouse_dir == SOUTH) mouse_y--;
-        else if (mouse_dir == WEST) mouse_x--;
-
-        if (current_phase == EXPLORE_TO_GOAL) {
-            visited_to_goal[mouse_y][mouse_x] = true;
-            static bool first_visit_goal[MAZE_SIZE][MAZE_SIZE] = {false};
-            if (first_visit_goal[mouse_y][mouse_x]) {
-                if (!is_junction(mouse_y, mouse_x)) revisited_cells[mouse_y][mouse_x] = true;
-            } else {
-                first_visit_goal[mouse_y][mouse_x] = true;
-            }
-        } else if (current_phase == EXPLORE_TO_START) {
-            visited_to_start[mouse_y][mouse_x] = true;
-            static bool first_visit_start[MAZE_SIZE][MAZE_SIZE] = {false};
-            if (first_visit_start[mouse_y][mouse_x]) {
-                if (!is_junction(mouse_y, mouse_x)) revisited_cells[mouse_y][mouse_x] = true;
-            } else {
-                first_visit_start[mouse_y][mouse_x] = true;
-            }
-        }
-
-        char color = (current_phase == SPEED_TO_GOAL) ? 'Y' : 'B';
-        API_setColor(mouse_x, mouse_y, color);
-
-        if (current_phase == SPEED_TO_GOAL) {
-            visited_speed[mouse_y][mouse_x] = true;
-        }
+        API_setColor(mouse_x, mouse_y,
+                     current_phase == SPEED_TO_GOAL ? 'Y' : 'B');
     }
 
+#if REPORT_STATS
+    reportStats();
+#endif
     debug_log("Run complete.");
     return 0;
 }

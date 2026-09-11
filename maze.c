@@ -4,414 +4,298 @@
 #include "API.h"
 #include "maze.h"
 
-// Global variables (extern declarations should be in maze.h if needed by other files)
-extern int mouse_x, mouse_y;
-extern Direction mouse_dir;
-extern Phase current_phase;
-extern bool v_walls[MAZE_SIZE][MAZE_SIZE + 1];
-extern bool h_walls[MAZE_SIZE + 1][MAZE_SIZE];
-extern uint8_t dist[MAZE_SIZE][MAZE_SIZE];
-extern bool visited_to_goal[MAZE_SIZE][MAZE_SIZE];
-extern bool visited_to_start[MAZE_SIZE][MAZE_SIZE];
-extern bool visited_speed[MAZE_SIZE][MAZE_SIZE];
-extern bool backtrack_cells[MAZE_SIZE][MAZE_SIZE];
-extern bool revisited_cells[MAZE_SIZE][MAZE_SIZE];
-extern int queue[QUEUE_SIZE][2];
-extern int queue_head, queue_tail;
-extern Phase current_phase; // need phase to restrict dead-end filling to exploration
-extern bool dead_end_cells[MAZE_SIZE][MAZE_SIZE];
+/* ---------------------------------------------------------------- state --- */
 
-// Debug logging function for MMS console
-void debug_log(char* text) {
+int       mouse_x, mouse_y;
+Direction mouse_dir;
+Phase     current_phase;
+
+/* A wall bit is only ever set together with its known bit, so "wall" implies
+   "known". An edge that is not known reads as open to the optimistic search
+   and as closed to the pessimistic one. */
+static bool v_wall[MAZE_SIZE][MAZE_SIZE + 1];
+static bool h_wall[MAZE_SIZE + 1][MAZE_SIZE];
+static bool v_known[MAZE_SIZE][MAZE_SIZE + 1];
+static bool h_known[MAZE_SIZE + 1][MAZE_SIZE];
+
+/* Only used to break ties between equally good moves while exploring. */
+static bool visited[MAZE_SIZE][MAZE_SIZE];
+
+/* cost_map[y][x][h] is the cost of the best route to the current target from
+   cell (y,x) facing h. Because it is indexed by pose rather than position, it
+   only goes stale when a wall is discovered or the target changes, never when
+   the mouse moves. cost_mode is the interpretation it was built with, which
+   nextMove has to agree with. */
+static uint16_t cost_map[MAZE_SIZE][MAZE_SIZE][4];
+static uint16_t scratch[MAZE_SIZE][MAZE_SIZE][4];
+static WallMode cost_mode = WALLS_OPTIMISTIC;
+
+static const int  DX[4]       = {  0,   1,   0,  -1  };
+static const int  DY[4]       = {  1,   0,  -1,   0  };
+static const char DIR_CHAR[4] = { 'n', 'e', 's', 'w' };
+
+#define NSTATES        (MAZE_SIZE * MAZE_SIZE * 4)
+#define STATE(y, x, h) ((((y) * MAZE_SIZE + (x)) * 4) + (h))
+
+void debug_log(const char *text) {
     fprintf(stderr, "%s\n", text);
     fflush(stderr);
 }
 
-// Helper: returns true if cell is a junction (3+ open directions)
-bool is_junction(int y, int x) {
-    int open = 0;
-    if (y < MAZE_SIZE - 1 && !h_walls[y + 1][x]) open++;
-    if (y > 0 && !h_walls[y][x]) open++;
-    if (x < MAZE_SIZE - 1 && !v_walls[y][x + 1]) open++;
-    if (x > 0 && !v_walls[y][x]) open++;
-    return open >= 3;
+/* ------------------------------------------------------------ wall model --- */
+
+static bool *wallPtr(int y, int x, int d) {
+    switch (d) {
+        case NORTH: return &h_wall[y + 1][x];
+        case SOUTH: return &h_wall[y][x];
+        case EAST:  return &v_wall[y][x + 1];
+        default:    return &v_wall[y][x];
+    }
 }
 
-// Floodfill for current phase target (goal center or start)
-void floodfill_phase(Phase phase) {
-    queue_head = queue_tail = 0;
+static bool *knownPtr(int y, int x, int d) {
+    switch (d) {
+        case NORTH: return &h_known[y + 1][x];
+        case SOUTH: return &h_known[y][x];
+        case EAST:  return &v_known[y][x + 1];
+        default:    return &v_known[y][x];
+    }
+}
+
+static bool inBounds(int y, int x) {
+    return y >= 0 && y < MAZE_SIZE && x >= 0 && x < MAZE_SIZE;
+}
+
+static bool blocked(int y, int x, int d, WallMode mode) {
+    if (!inBounds(y + DY[d], x + DX[d])) return true;
+    if (*wallPtr(y, x, d)) return true;
+    if (mode == WALLS_PESSIMISTIC && !*knownPtr(y, x, d)) return true;
+    return false;
+}
+
+static bool recordEdge(int y, int x, int d, bool wall) {
+    bool *w = wallPtr(y, x, d);
+    bool *k = knownPtr(y, x, d);
+    bool newly_walled = wall && !*w;
+    if (wall) *w = true;
+    *k = true;
+    return newly_walled;
+}
+
+static uint16_t turnCost(int from, int to) {
+    int diff = (to - from) & 3;
+    if (diff == 0) return 0;
+    return (diff == 2) ? (2 * TURN_COST) : TURN_COST;
+}
+
+/* ------------------------------------------------------------- odometry --- */
+
+bool updateWalls(void) {
+    int  dirs[3]   = { mouse_dir, (mouse_dir + 3) & 3, (mouse_dir + 1) & 3 };
+    bool sensed[3];
+    bool changed = false;
+
+    sensed[0] = API_wallFront();
+    sensed[1] = API_wallLeft();
+    sensed[2] = API_wallRight();
+
+    for (int i = 0; i < 3; i++) {
+        if (recordEdge(mouse_y, mouse_x, dirs[i], sensed[i])) changed = true;
+        if (sensed[i]) API_setWall(mouse_x, mouse_y, DIR_CHAR[dirs[i]]);
+    }
+    return changed;
+}
+
+void applyMove(void) {
+    /* The edge just crossed is open, and now known to be. */
+    recordEdge(mouse_y, mouse_x, mouse_dir, false);
+    mouse_y += DY[mouse_dir];
+    mouse_x += DX[mouse_dir];
+    visited[mouse_y][mouse_x] = true;
+}
+
+bool atGoal(void) {
+    return mouse_x >= GOAL_LO && mouse_x <= GOAL_HI &&
+           mouse_y >= GOAL_LO && mouse_y <= GOAL_HI;
+}
+
+bool atStart(void) {
+    return mouse_x == 0 && mouse_y == 0;
+}
+
+/* ---------------------------------------------------------------- search --- */
+
+/* Label-correcting shortest path over the 1024 (cell, heading) poses, run
+   backwards from the target so that out[y][x][h] is the cost of finishing the
+   route from that pose. Costs are unequal, so plain breadth-first search would
+   be wrong here; the in-queue flag keeps each pose in the queue at most once,
+   which bounds the queue at NSTATES without a heap or a bucket pool. */
+static uint16_t q_buf[NSTATES];
+static bool     q_in[NSTATES];
+
+static void computeCosts(bool to_goal, WallMode mode,
+                         uint16_t out[MAZE_SIZE][MAZE_SIZE][4]) {
+    int head = 0, tail = 0, count = 0;
+
     for (int y = 0; y < MAZE_SIZE; y++)
         for (int x = 0; x < MAZE_SIZE; x++)
-            dist[y][x] = MAX_DIST;
+            for (int h = 0; h < 4; h++) {
+                out[y][x][h] = COST_INF;
+                q_in[STATE(y, x, h)] = false;
+            }
 
-    if (phase == EXPLORE_TO_GOAL || phase == SPEED_TO_GOAL) {
-        enqueue(7, 7); dist[7][7] = 0;
-        enqueue(7, 8); dist[7][8] = 0;
-        enqueue(8, 7); dist[8][7] = 0;
-        enqueue(8, 8); dist[8][8] = 0;
-    } else { // to start
-        enqueue(0, 0); dist[0][0] = 0;
-    }
-
-    int cy, cx;
-    while (dequeue(&cy, &cx)) {
-        uint8_t d = dist[cy][cx] + 1;
-        // North
-        if (cy < MAZE_SIZE - 1 && !h_walls[cy + 1][cx] && dist[cy + 1][cx] > d) { dist[cy + 1][cx] = d; enqueue(cy + 1, cx);}    
-        // East
-        if (cx < MAZE_SIZE - 1 && !v_walls[cy][cx + 1] && dist[cy][cx + 1] > d) { dist[cy][cx + 1] = d; enqueue(cy, cx + 1);}    
-        // South
-        if (cy > 0 && !h_walls[cy][cx] && dist[cy - 1][cx] > d) { dist[cy - 1][cx] = d; enqueue(cy - 1, cx);}    
-        // West
-        if (cx > 0 && !v_walls[cy][cx] && dist[cy][cx - 1] > d) { dist[cy][cx - 1] = d; enqueue(cy, cx - 1);}    
-    }
-}
-
-// Queue helpers
-void enqueue(int y, int x) {
-    if (queue_tail >= QUEUE_SIZE) return;
-    queue[queue_tail][0] = y;
-    queue[queue_tail][1] = x;
-    queue_tail++;
-}
-
-bool dequeue(int *y, int *x) {
-    if (queue_head >= queue_tail) return false;
-    *y = queue[queue_head][0];
-    *x = queue[queue_head][1];
-    queue_head++;
-    return true;
-}
-
-// Initialize walls
-void initWalls() {
-    for (int y = 0; y < MAZE_SIZE; y++) {
-        for (int x = 0; x < MAZE_SIZE + 1; x++) {
-            v_walls[y][x] = false;
-        }
-    }
-    for (int y = 0; y < MAZE_SIZE + 1; y++) {
-        for (int x = 0; x < MAZE_SIZE; x++) {
-            h_walls[y][x] = false;
-        }
-    }
-    for (int i = 0; i < MAZE_SIZE; i++) {
-        v_walls[i][0] = true;
-        v_walls[i][MAZE_SIZE] = true;
-        h_walls[0][i] = true;
-        h_walls[MAZE_SIZE][i] = true;
-    }
-}
-
-// Update walls based on sensors
-void updateWalls() {
-    if (API_wallFront()) {
-        if (mouse_dir == NORTH) {
-            h_walls[mouse_y + 1][mouse_x] = true;
-            API_setWall(mouse_x, mouse_y, 'n');
-        } else if (mouse_dir == EAST) {
-            v_walls[mouse_y][mouse_x + 1] = true;
-            API_setWall(mouse_x, mouse_y, 'e');
-        } else if (mouse_dir == SOUTH) {
-            h_walls[mouse_y][mouse_x] = true;
-            API_setWall(mouse_x, mouse_y, 's');
-        } else if (mouse_dir == WEST) {
-            v_walls[mouse_y][mouse_x] = true;
-            API_setWall(mouse_x, mouse_y, 'w');
-        }
-    }
-    if (API_wallLeft()) {
-        if (mouse_dir == NORTH) {
-            v_walls[mouse_y][mouse_x] = true;
-            API_setWall(mouse_x, mouse_y, 'w');
-        } else if (mouse_dir == EAST) {
-            h_walls[mouse_y + 1][mouse_x] = true;
-            API_setWall(mouse_x, mouse_y, 'n');
-        } else if (mouse_dir == SOUTH) {
-            v_walls[mouse_y][mouse_x + 1] = true;
-            API_setWall(mouse_x, mouse_y, 'e');
-        } else if (mouse_dir == WEST) {
-            h_walls[mouse_y][mouse_x] = true;
-            API_setWall(mouse_x, mouse_y, 's');
-        }
-    }
-    if (API_wallRight()) {
-        if (mouse_dir == NORTH) {
-            v_walls[mouse_y][mouse_x + 1] = true;
-            API_setWall(mouse_x, mouse_y, 'e');
-        } else if (mouse_dir == EAST) {
-            h_walls[mouse_y][mouse_x] = true;
-            API_setWall(mouse_x, mouse_y, 's');
-        } else if (mouse_dir == SOUTH) {
-            v_walls[mouse_y][mouse_x] = true;
-            API_setWall(mouse_x, mouse_y, 'w');
-        } else if (mouse_dir == WEST) {
-            h_walls[mouse_y + 1][mouse_x] = true;
-            API_setWall(mouse_x, mouse_y, 'n');
-        }
-    }
-
-    // Mark dead-end cells only during exploration phases (do not modify walls here)
-    if (current_phase == EXPLORE_TO_GOAL || current_phase == EXPLORE_TO_START) {
-        checkDeadEnd();
-    }
-}
-
-// Backwards compatibility wrappers (optional - can be removed if not referenced elsewhere)
-void floodfill_to_goal() { floodfill_phase(EXPLORE_TO_GOAL); }
-void floodfill_to_start() { floodfill_phase(EXPLORE_TO_START); }
-
-// Choose best direction
-int getBestDirection() {
-    uint8_t min_dist = MAX_DIST;
-    int best_dir = 0;
-    bool found = false;
-
-    // Metadata for tie-breaking during EXPLORE_TO_START
-    bool best_unexplored_global = false; // not visited in either phase
-    bool best_unvisited_start = false;   // not yet visited in EXPLORE_TO_START phase
-
-    bool use_sensors = (current_phase != SPEED_TO_GOAL);
-    bool wall_front = false, wall_left = false, wall_right = false, wall_back = false;
-
-    uint8_t (*use_dist)[MAZE_SIZE] = dist;
-
-    if (use_sensors) {
-        wall_front = API_wallFront();
-        wall_left = API_wallLeft();
-        wall_right = API_wallRight();
+    if (to_goal) {
+        for (int y = GOAL_LO; y <= GOAL_HI; y++)
+            for (int x = GOAL_LO; x <= GOAL_HI; x++)
+                for (int h = 0; h < 4; h++) {
+                    out[y][x][h] = 0;
+                    q_buf[tail] = (uint16_t)STATE(y, x, h);
+                    q_in[STATE(y, x, h)] = true;
+                    tail = (tail + 1) % NSTATES;
+                    count++;
+                }
     } else {
-        switch (mouse_dir) {
-            case NORTH:
-                wall_front = h_walls[mouse_y + 1][mouse_x];
-                wall_left = v_walls[mouse_y][mouse_x];
-                wall_right = v_walls[mouse_y][mouse_x + 1];
-                wall_back = h_walls[mouse_y][mouse_x];
-                break;
-            case EAST:
-                wall_front = v_walls[mouse_y][mouse_x + 1];
-                wall_left = h_walls[mouse_y + 1][mouse_x];
-                wall_right = h_walls[mouse_y][mouse_x];
-                wall_back = v_walls[mouse_y][mouse_x];
-                break;
-            case SOUTH:
-                wall_front = h_walls[mouse_y][mouse_x];
-                wall_left = v_walls[mouse_y][mouse_x + 1];
-                wall_right = v_walls[mouse_y][mouse_x];
-                wall_back = h_walls[mouse_y + 1][mouse_x];
-                break;
-            case WEST:
-                wall_front = v_walls[mouse_y][mouse_x];
-                wall_left = h_walls[mouse_y][mouse_x];
-                wall_right = h_walls[mouse_y + 1][mouse_x];
-                wall_back = v_walls[mouse_y][mouse_x + 1];
-                break;
+        for (int h = 0; h < 4; h++) {
+            out[0][0][h] = 0;
+            q_buf[tail] = (uint16_t)STATE(0, 0, h);
+            q_in[STATE(0, 0, h)] = true;
+            tail = (tail + 1) % NSTATES;
+            count++;
         }
     }
 
-    int fx = mouse_x, fy = mouse_y;
-    if (mouse_dir == NORTH) fy++;
-    else if (mouse_dir == EAST) fx++;
-    else if (mouse_dir == SOUTH) fy--;
-    else if (mouse_dir == WEST) fx--;
-    if (fx >= 0 && fx < MAZE_SIZE && fy >= 0 && fy < MAZE_SIZE && !wall_front) {
-        uint8_t cand = use_dist[fy][fx];
-        bool cand_unvisited_start = !visited_to_start[fy][fx];
-        bool cand_unexplored_global = !(visited_to_goal[fy][fx] || visited_to_start[fy][fx]);
-        if (cand < min_dist && (current_phase != SPEED_TO_GOAL || (!visited_speed[fy][fx] && !backtrack_cells[fy][fx] && (!revisited_cells[fy][fx] || is_junction(fy, fx))))) {
-            min_dist = cand; best_dir = 0; found = true;
-            best_unvisited_start = cand_unvisited_start; best_unexplored_global = cand_unexplored_global;
-        } else if (cand == min_dist && found && current_phase == EXPLORE_TO_START) {
-            if (cand_unexplored_global > best_unexplored_global ||
-               (cand_unexplored_global == best_unexplored_global && cand_unvisited_start > best_unvisited_start)) {
-                best_dir = 0; best_unvisited_start = cand_unvisited_start; best_unexplored_global = cand_unexplored_global;
-            }
-        }
-    }
+    while (count > 0) {
+        uint16_t s = q_buf[head];
+        head = (head + 1) % NSTATES;
+        count--;
+        q_in[s] = false;
 
-    int lx = mouse_x, ly = mouse_y;
-    if (mouse_dir == NORTH) lx--;
-    else if (mouse_dir == EAST) ly++;
-    else if (mouse_dir == SOUTH) lx++;
-    else if (mouse_dir == WEST) ly--;
-    if (lx >= 0 && lx < MAZE_SIZE && ly >= 0 && ly < MAZE_SIZE && !wall_left) {
-        uint8_t cand = use_dist[ly][lx];
-        bool cand_unvisited_start = !visited_to_start[ly][lx];
-        bool cand_unexplored_global = !(visited_to_goal[ly][lx] || visited_to_start[ly][lx]);
-        if (cand < min_dist && (current_phase != SPEED_TO_GOAL || (!visited_speed[ly][lx] && !backtrack_cells[ly][lx] && (!revisited_cells[ly][lx] || is_junction(ly, lx))))) {
-            min_dist = cand; best_dir = -1; found = true;
-            best_unvisited_start = cand_unvisited_start; best_unexplored_global = cand_unexplored_global;
-        } else if (cand == min_dist && found && current_phase == EXPLORE_TO_START) {
-            if (cand_unexplored_global > best_unexplored_global ||
-               (cand_unexplored_global == best_unexplored_global && cand_unvisited_start > best_unvisited_start)) {
-                best_dir = -1; best_unvisited_start = cand_unvisited_start; best_unexplored_global = cand_unexplored_global;
-            }
-        }
-    }
+        int h = s & 3;
+        int x = (s >> 2) % MAZE_SIZE;
+        int y = (s >> 2) / MAZE_SIZE;
+        uint16_t c = out[y][x][h];
 
-    int rx = mouse_x, ry = mouse_y;
-    if (mouse_dir == NORTH) rx++;
-    else if (mouse_dir == EAST) ry--;
-    else if (mouse_dir == SOUTH) rx--;
-    else if (mouse_dir == WEST) ry++;
-    if (rx >= 0 && rx < MAZE_SIZE && ry >= 0 && ry < MAZE_SIZE && !wall_right) {
-        uint8_t cand = use_dist[ry][rx];
-        bool cand_unvisited_start = !visited_to_start[ry][rx];
-        bool cand_unexplored_global = !(visited_to_goal[ry][rx] || visited_to_start[ry][rx]);
-        if (cand < min_dist && (current_phase != SPEED_TO_GOAL || (!visited_speed[ry][rx] && !backtrack_cells[ry][rx] && (!revisited_cells[ry][rx] || is_junction(ry, rx))))) {
-            min_dist = cand; best_dir = 1; found = true;
-            best_unvisited_start = cand_unvisited_start; best_unexplored_global = cand_unexplored_global;
-        } else if (cand == min_dist && found && current_phase == EXPLORE_TO_START) {
-            if (cand_unexplored_global > best_unexplored_global ||
-               (cand_unexplored_global == best_unexplored_global && cand_unvisited_start > best_unvisited_start)) {
-                best_dir = 1; best_unvisited_start = cand_unvisited_start; best_unexplored_global = cand_unexplored_global;
-            }
-        }
-    }
+        /* Predecessors: the pose that reaches (y,x,h) came from the cell one
+           step back along h, after turning onto h from some heading ph. */
+        int py = y - DY[h];
+        int px = x - DX[h];
+        if (!inBounds(py, px)) continue;
+        if (blocked(py, px, h, mode)) continue;
 
-    int bx = mouse_x, by = mouse_y;
-    if (mouse_dir == NORTH) by--;
-    else if (mouse_dir == EAST) bx--;
-    else if (mouse_dir == SOUTH) by++;
-    else if (mouse_dir == WEST) bx++;
-    if (bx >= 0 && bx < MAZE_SIZE && by >= 0 && by < MAZE_SIZE && !wall_back) {
-        uint8_t cand = use_dist[by][bx];
-        bool cand_unvisited_start = !visited_to_start[by][bx];
-        bool cand_unexplored_global = !(visited_to_goal[by][bx] || visited_to_start[by][bx]);
-        if (cand < min_dist && (current_phase != SPEED_TO_GOAL || (!visited_speed[by][bx] && !backtrack_cells[by][bx] && (!revisited_cells[by][bx] || is_junction(by, bx))))) {
-            min_dist = cand; best_dir = 2; found = true;
-            best_unvisited_start = cand_unvisited_start; best_unexplored_global = cand_unexplored_global;
-        } else if (cand == min_dist && found && current_phase == EXPLORE_TO_START) {
-            if (cand_unexplored_global > best_unexplored_global ||
-               (cand_unexplored_global == best_unexplored_global && cand_unvisited_start > best_unvisited_start)) {
-                best_dir = 2; best_unvisited_start = cand_unvisited_start; best_unexplored_global = cand_unexplored_global;
-            }
-        }
-    }
-
-    if (current_phase == SPEED_TO_GOAL && !found) {
-        min_dist = MAX_DIST;
-        fx = mouse_x; fy = mouse_y;
-        if (mouse_dir == NORTH) fy++; else if (mouse_dir == EAST) fx++; else if (mouse_dir == SOUTH) fy--; else if (mouse_dir == WEST) fx--;
-    if (fx >= 0 && fx < MAZE_SIZE && fy >= 0 && fy < MAZE_SIZE && !wall_front && use_dist[fy][fx] < min_dist) {
-            min_dist = use_dist[fy][fx]; best_dir = 0; found = true;
-        }
-        lx = mouse_x; ly = mouse_y;
-        if (mouse_dir == NORTH) lx--; else if (mouse_dir == EAST) ly++; else if (mouse_dir == SOUTH) lx++; else if (mouse_dir == WEST) ly--;
-    if (lx >= 0 && lx < MAZE_SIZE && ly >= 0 && ly < MAZE_SIZE && !wall_left && use_dist[ly][lx] < min_dist) {
-            min_dist = use_dist[ly][lx]; best_dir = -1; found = true;
-        }
-        rx = mouse_x; ry = mouse_y;
-        if (mouse_dir == NORTH) rx++; else if (mouse_dir == EAST) ry--; else if (mouse_dir == SOUTH) rx--; else if (mouse_dir == WEST) ry++;
-    if (rx >= 0 && rx < MAZE_SIZE && ry >= 0 && ry < MAZE_SIZE && !wall_right && use_dist[ry][rx] < min_dist) {
-            min_dist = use_dist[ry][rx]; best_dir = 1; found = true;
-        }
-        bx = mouse_x; by = mouse_y;
-        if (mouse_dir == NORTH) by--; else if (mouse_dir == EAST) bx--; else if (mouse_dir == SOUTH) by++; else if (mouse_dir == WEST) bx++;
-    if (bx >= 0 && bx < MAZE_SIZE && by >= 0 && by < MAZE_SIZE && !wall_back && use_dist[by][bx] < min_dist) {
-            min_dist = use_dist[by][bx]; best_dir = 2; found = true;
-        }
-    }
-
-    return best_dir;
-}
-
-// Show combined-distance overlay during speed run
-void show_dist() {
-    for (int y = 0; y < MAZE_SIZE; y++) {
-        for (int x = 0; x < MAZE_SIZE; x++) {
-            if (dist[y][x] != MAX_DIST) {
-                char text[4];
-                snprintf(text, sizeof(text), "%d", dist[y][x]);
-                API_setText(x, y, text);
-            } else {
-                API_clearText(x, y);
-            }
-        }
-    }
-}
-
-// Dead-end detection algorithm: iteratively find cells (excluding start (0,0) and 4 goal center cells)
-// that currently have exactly one open neighbor (i.e., 3 surrounding walls). Instead of sealing,
-// we mark them in dead_end_cells. We simulate sealing by treating newly marked dead-ends as closed
-// for the purpose of propagating further dead-end detection in the same pass.
-void checkDeadEnd() {
-    // First clear previous marks (could optimize with dirty tracking)
-    for (int y = 0; y < MAZE_SIZE; y++)
-        for (int x = 0; x < MAZE_SIZE; x++)
-            dead_end_cells[y][x] = false;
-
-    bool changed = true;
-    bool considered[MAZE_SIZE][MAZE_SIZE] = {false};
-    while (changed) {
-        changed = false;
-        for (int y = 0; y < MAZE_SIZE; y++) {
-            for (int x = 0; x < MAZE_SIZE; x++) {
-                if ((x == 0 && y == 0) || ((x == 7 || x == 8) && (y == 7 || y == 8))) continue;
-                if (considered[y][x]) continue; // already finalized as not a dead-end in previous iteration
-                // Skip cells not yet visited in any exploration phase to avoid speculative pruning
-                if (!(visited_to_goal[y][x] || visited_to_start[y][x])) continue;
-
-                int open_dirs = 0;
-                // Count open neighbors treating already-marked dead ends as closed
-                // North
-                if (y < MAZE_SIZE - 1 && !h_walls[y + 1][x] && !dead_end_cells[y + 1][x]) open_dirs++;
-                // East
-                if (x < MAZE_SIZE - 1 && !v_walls[y][x + 1] && !dead_end_cells[y][x + 1]) open_dirs++;
-                // South
-                if (y > 0 && !h_walls[y][x] && !dead_end_cells[y - 1][x]) open_dirs++;
-                // West
-                if (x > 0 && !v_walls[y][x] && !dead_end_cells[y][x - 1]) open_dirs++;
-
-                if (open_dirs <= 1) { // treat 0 or 1 as dead-end (0 could happen after neighbors marked)
-                    if (!dead_end_cells[y][x]) {
-                        dead_end_cells[y][x] = true;
-                        changed = true;
-                    }
-                } else {
-                    considered[y][x] = true; // stable non-dead-end
+        for (int ph = 0; ph < 4; ph++) {
+            uint32_t nc = (uint32_t)c + STEP_COST + turnCost(ph, h);
+            if (nc < out[py][px][ph]) {
+                out[py][px][ph] = (uint16_t)nc;
+                int ns = STATE(py, px, ph);
+                if (!q_in[ns]) {
+                    q_buf[tail] = (uint16_t)ns;
+                    q_in[ns] = true;
+                    tail = (tail + 1) % NSTATES;
+                    count++;
                 }
             }
         }
     }
 }
 
-// Floodfill variant for speed run: treat any cell that is unvisited (in both phases) or marked as dead-end as blocked.
-void floodfill_speed_run() {
-    queue_head = queue_tail = 0;
-    for (int y = 0; y < MAZE_SIZE; y++)
-        for (int x = 0; x < MAZE_SIZE; x++)
-            dist[y][x] = MAX_DIST;
+void computeCostMap(Phase phase) {
+    cost_mode = (phase == SPEED_TO_GOAL) ? WALLS_PESSIMISTIC : WALLS_OPTIMISTIC;
+    computeCosts(phase != EXPLORE_TO_START, cost_mode, cost_map);
+}
 
-    // Seed goal center
-    enqueue(7, 7); dist[7][7] = 0;
-    enqueue(7, 8); dist[7][8] = 0;
-    enqueue(8, 7); dist[8][7] = 0;
-    enqueue(8, 8); dist[8][8] = 0;
+uint16_t routeCost(WallMode mode) {
+    computeCosts(true, mode, scratch);
+    return scratch[mouse_y][mouse_x][mouse_dir];
+}
 
-    int cy, cx;
-    while (dequeue(&cy, &cx)) {
-        uint8_t d = dist[cy][cx] + 1;
-        // Skip propagation into invalid cells
-        // North
-        if (cy < MAZE_SIZE - 1 && !h_walls[cy + 1][cx] && dist[cy + 1][cx] > d) {
-            int ny = cy + 1, nx = cx;
-            if ((visited_to_goal[ny][nx] || visited_to_start[ny][nx]) && !dead_end_cells[ny][nx]) { dist[ny][nx] = d; enqueue(ny, nx);}    
-        }
-        // East
-        if (cx < MAZE_SIZE - 1 && !v_walls[cy][cx + 1] && dist[cy][cx + 1] > d) {
-            int ny = cy, nx = cx + 1;
-            if ((visited_to_goal[ny][nx] || visited_to_start[ny][nx]) && !dead_end_cells[ny][nx]) { dist[ny][nx] = d; enqueue(ny, nx);}    
-        }
-        // South
-        if (cy > 0 && !h_walls[cy][cx] && dist[cy - 1][cx] > d) {
-            int ny = cy - 1, nx = cx;
-            if ((visited_to_goal[ny][nx] || visited_to_start[ny][nx]) && !dead_end_cells[ny][nx]) { dist[ny][nx] = d; enqueue(ny, nx);}    
-        }
-        // West
-        if (cx > 0 && !v_walls[cy][cx] && dist[cy][cx - 1] > d) {
-            int ny = cy, nx = cx - 1;
-            if ((visited_to_goal[ny][nx] || visited_to_start[ny][nx]) && !dead_end_cells[ny][nx]) { dist[ny][nx] = d; enqueue(ny, nx);}    
+bool explorationComplete(void) {
+    uint16_t optimistic = routeCost(WALLS_OPTIMISTIC);
+    uint16_t pessimistic = routeCost(WALLS_PESSIMISTIC);
+    return pessimistic != COST_INF && pessimistic == optimistic;
+}
+
+/* Picks the move that lies exactly on a shortest route. The equality test is
+   exact because the cost map satisfies the Bellman equation, so a move that
+   fails it is not on any optimal route and a pose with no passing move is a
+   real error rather than something to paper over. */
+TurnCmd nextMove(void) {
+    static const TurnCmd candidates[4] = {
+        TURN_STRAIGHT, TURN_LEFT, TURN_RIGHT, TURN_BACK
+    };
+    uint16_t here = cost_map[mouse_y][mouse_x][mouse_dir];
+    TurnCmd best = TURN_BLOCKED;
+    bool best_is_new = false;
+    bool exploring = (current_phase != SPEED_TO_GOAL);
+
+    if (here == COST_INF) return TURN_BLOCKED;
+
+    for (int i = 0; i < 4; i++) {
+        int h = (mouse_dir + (int)candidates[i] + 4) & 3;
+        if (blocked(mouse_y, mouse_x, h, cost_mode)) continue;
+
+        int ny = mouse_y + DY[h];
+        int nx = mouse_x + DX[h];
+        uint16_t there = cost_map[ny][nx][h];
+        if (there == COST_INF) continue;
+        if ((uint32_t)there + STEP_COST + turnCost(mouse_dir, h) != here) continue;
+
+        /* Every survivor costs the same, so preferring an unseen cell while
+           exploring is free. */
+        bool is_new = !visited[ny][nx];
+        if (best == TURN_BLOCKED || (exploring && is_new && !best_is_new)) {
+            best = candidates[i];
+            best_is_new = is_new;
         }
     }
+    return best;
+}
+
+/* ----------------------------------------------------------------- misc --- */
+
+void showCosts(void) {
+    for (int y = 0; y < MAZE_SIZE; y++) {
+        for (int x = 0; x < MAZE_SIZE; x++) {
+            uint16_t best = COST_INF;
+            for (int h = 0; h < 4; h++)
+                if (cost_map[y][x][h] < best) best = cost_map[y][x][h];
+
+            if (best == COST_INF) {
+                API_clearText(x, y);
+            } else {
+                char text[8];
+                snprintf(text, sizeof(text), "%u", (unsigned)best);
+                API_setText(x, y, text);
+            }
+        }
+    }
+}
+
+void resetState(void) {
+    for (int y = 0; y < MAZE_SIZE; y++)
+        for (int x = 0; x < MAZE_SIZE + 1; x++) {
+            v_wall[y][x] = false;
+            v_known[y][x] = false;
+        }
+    for (int y = 0; y < MAZE_SIZE + 1; y++)
+        for (int x = 0; x < MAZE_SIZE; x++) {
+            h_wall[y][x] = false;
+            h_known[y][x] = false;
+        }
+    for (int y = 0; y < MAZE_SIZE; y++)
+        for (int x = 0; x < MAZE_SIZE; x++)
+            visited[y][x] = false;
+
+    for (int i = 0; i < MAZE_SIZE; i++) {
+        v_wall[i][0]             = v_known[i][0]             = true;
+        v_wall[i][MAZE_SIZE]     = v_known[i][MAZE_SIZE]     = true;
+        h_wall[0][i]             = h_known[0][i]             = true;
+        h_wall[MAZE_SIZE][i]     = h_known[MAZE_SIZE][i]     = true;
+    }
+
+    mouse_x = 0;
+    mouse_y = 0;
+    mouse_dir = NORTH;
+    current_phase = EXPLORE_TO_GOAL;
+    visited[0][0] = true;
+    computeCostMap(EXPLORE_TO_GOAL);
 }
